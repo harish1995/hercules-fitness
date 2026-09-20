@@ -1,0 +1,35 @@
+# dependencies
+node_modules
+
+# build output
+dist
+coverage
+*.tsbuildinfo
+
+# environment (NEVER commit real values; use .env.example as the template)
+.env
+.env.*
+!.env.example
+
+# service-account / private keys: the Admin SDK is never used here, and its credentials must never be committed
+*firebase-adminsdk*.json
+serviceAccount*.json
+*.pem
+
+# firebase local state / emulator output
+.firebase
+firebase-debug.log*
+firestore-debug.log
+ui-debug.log
+*-debug.log
+firebase-export-*/
+
+# editor / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# logs
+npm-debug.log*
+*.log

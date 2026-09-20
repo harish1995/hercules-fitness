@@ -1,0 +1,683 @@
+rules_version = '2';
+
+// Hercules Fitness Firestore rules. DENY BY DEFAULT; per-collection rules sit ABOVE the catch-all at the bottom.
+// Roles come ONLY from users/{uid}, which no client can write (AC-12). Rules validate identity, role, shape,
+// immutability and the cross-document invariants (member ID <-> counter <-> exactly one new member; membership <->
+// member summary; payment <-> membership paid total <-> member pending total). See docs/architecture section 3.
+// Collections: members, memberMedical, memberPhotos, trainers, counters, auditLogs (Phase 2); membershipPlans, memberships
+// (Phase 3); payments (Phase 4); attendance (Phase 5). Phase 6 (reports) adds no collection: only the Admin-only REPORT_EXPORTED
+// audit record. Phase 7 (notifications abstraction, read-only Settings page) adds no rule: `notifications` and `settings` stay
+// denied to every client because nothing in the app reads or writes them (NEW-21).
+// Phase 8 (hardening): (1) AUDIT ATOMICITY (architecture 3.4): a members / memberships / payments write must name, in `lastAuditId`, an
+// audit record created in the SAME commit and about that document and action (`auditAbout`); (2) the member-create rule was
+// refactored into short `d.x` functions and `hasRole()` lost its redundant `exists()`, to give the 1000-expression limit room for (1)
+// (registering with a plan + first payment + medical notes is the heaviest commit; tests/rules/budget.test.ts measures the headroom);
+// (3) `trainers` are readable by Staff and Admin only (matrix: Member no). One test per Permission-Matrix row: tests/rules/matrix.test.ts.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- helpers
+    function signedIn()  { return request.auth != null; }
+    function userPath()  { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    // An active users/{uid} document must exist. A missing doc, active != true, or a missing/odd field errors => denied.
+    // (Phase 8: no separate exists(): get() of a missing document already errors, and every rule that reads the role treats an
+    // error as a denial. That saves ~8 expressions per role check, which the audit-atomicity checks needed.)
+    function hasRole()   { return signedIn() && get(userPath()).data.active == true; }
+    function role()      { return get(userPath()).data.role; }
+    function isAdmin()   { return hasRole() && role() == 'ADMIN'; }
+    function isStaff()   { return hasRole() && role() == 'STAFF'; }
+    function isMember()  { return hasRole() && role() == 'MEMBER'; }
+    function staffOrAdmin() { return isAdmin() || isStaff(); }
+    function myMemberDocId() { return get(userPath()).data.memberDocId; }   // future MEMBER login
+
+    function changed(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+    function unchanged(f)  { return request.resource.data[f] == resource.data[f]; }
+    function serverTime(f) { return request.resource.data[f] == request.time; }
+    function actorIs(f)    { return request.resource.data[f] == request.auth.uid; }
+
+    // A calendar day is stored as 00:00:00.000 Asia/Kolkata (18:30 UTC the day before), i.e. millis-of-UTC-day 66,600,000 (D-1).
+    function isIstMidnight(ts) {
+      return ts is timestamp && (ts.toMillis() % 86400000 + 86400000) % 86400000 == 66600000;
+    }
+    function optString(v, max) { return v == null || (v is string && v.size() <= max); }
+    function validMobile(v)    { return v is string && v.matches('^[6-9][0-9]{9}$'); }
+
+    // ---------------------------------------------------------------- users (Phase 1, unchanged)
+    // A signed-in user may read ONLY their own doc. Nobody writes users from a client, ever.
+    match /users/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list: if false;
+      allow create, update, delete: if false;
+    }
+
+    // ---------------------------------------------------------------- counters (member-ID sequence)
+    // Monotone by exactly +1, never resettable, never deletable (US-2.2, AC-7). Each increment names the ONE member it
+    // was consumed for (`lastMemberDocId`) and that member must be created in the same commit with the matching ID, so
+    // a counter cannot be advanced (or an ID minted) without exactly one new member.
+    function memberPath(id) { return /databases/$(database)/documents/members/$(id); }
+    function counterOwnsNewMember(d) {
+      return d.lastMemberDocId is string && d.lastMemberDocId.size() >= 1 && d.lastMemberDocId.size() <= 100
+        && !exists(memberPath(d.lastMemberDocId))
+        && existsAfter(memberPath(d.lastMemberDocId))
+        && getAfter(memberPath(d.lastMemberDocId)).data.memberIdYear == d.year
+        && getAfter(memberPath(d.lastMemberDocId)).data.memberId == 'GYM-' + string(d.year) + '-' + paddedSeq(d.lastSeq);
+    }
+    function counterKeysOk(d) {
+      return d.keys().hasOnly(['year', 'lastSeq', 'lastMemberDocId', 'updatedAt', 'updatedBy'])
+        && d.keys().hasAll(['year', 'lastSeq', 'lastMemberDocId', 'updatedAt', 'updatedBy']);
+    }
+    match /counters/{counterId} {
+      allow read: if staffOrAdmin();
+      allow create: if staffOrAdmin()
+        && counterId.matches('^memberId-[0-9]{4}$')
+        && counterKeysOk(request.resource.data)
+        && request.resource.data.year is int
+        && counterId == 'memberId-' + string(request.resource.data.year)
+        && request.resource.data.year >= request.time.year() - 1
+        && request.resource.data.year <= request.time.year() + 1
+        && request.resource.data.lastSeq == 1
+        && counterOwnsNewMember(request.resource.data)
+        && serverTime('updatedAt') && actorIs('updatedBy');
+      allow update: if staffOrAdmin()
+        && counterKeysOk(request.resource.data)
+        && unchanged('year')
+        && request.resource.data.lastSeq is int
+        && request.resource.data.lastSeq == resource.data.lastSeq + 1
+        && counterOwnsNewMember(request.resource.data)
+        && serverTime('updatedAt') && actorIs('updatedBy');
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------- members
+    function memberKeys() {
+      return ['memberId', 'memberIdYear', 'firstName', 'lastName', 'displayName', 'gender', 'dateOfBirth', 'mobile',
+              'email', 'address', 'emergencyContact', 'trainerId', 'trainerName', 'joiningDate', 'generalNotes',
+              'hasPhoto', 'searchFullName', 'searchReverseName', 'searchMobile', 'suspended', 'suspendedAt',
+              'suspendedReason', 'suspendedBy', 'deleted', 'deletedAt', 'deletedBy', 'hasMembership', 'membership',
+              'pendingPaise', 'consent', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy', 'lastAuditId'];
+    }
+    // The only keys a profile EDIT (or the photo flag) may touch. Suspension, the membership summary, pendingPaise,
+    // consent and identity have their own update branches below.
+    function profileKeys() {
+      return ['firstName', 'lastName', 'displayName', 'gender', 'dateOfBirth', 'mobile', 'email', 'address',
+              'emergencyContact', 'trainerId', 'trainerName', 'joiningDate', 'generalNotes', 'hasPhoto',
+              'searchFullName', 'searchReverseName', 'searchMobile', 'updatedAt', 'updatedBy', 'lastAuditId'];
+    }
+
+    // displayName is exactly "first last"; the normalized search fields are derived from it. For plain-ASCII names the
+    // rules can reproduce the client's normalization exactly (lower-case, single spaces). For other scripts the client
+    // applies Unicode NFKD, which rules cannot compute, so there the search fields are only required to be lower-case.
+    function searchNamesConsistent(d) {
+      return d.displayName == d.firstName + ' ' + d.lastName
+        && d.searchFullName.size() >= 1 && d.searchReverseName.size() >= 1
+        && (d.displayName.matches('^[ -~]*$')
+            ? (d.searchFullName == d.displayName.lower()
+               && d.searchReverseName == (d.lastName + ' ' + d.firstName).lower())
+            : (d.searchFullName == d.searchFullName.lower() && d.searchReverseName == d.searchReverseName.lower()));
+    }
+
+    function keysExactly(d, k) { return d.keys().hasOnly(k) && d.keys().hasAll(k); }
+
+    function validProfile(d) {
+      return d.firstName is string && d.firstName.size() >= 1 && d.firstName.size() <= 50
+        && d.lastName is string && d.lastName.size() >= 1 && d.lastName.size() <= 50
+        && d.displayName is string && d.displayName.size() <= 101
+        && d.gender in ['MALE', 'FEMALE', 'OTHER']
+        && isIstMidnight(d.dateOfBirth) && d.dateOfBirth < request.time
+        && isIstMidnight(d.joiningDate) && d.joiningDate <= request.time
+        && validMobile(d.mobile)
+        && optString(d.email, 254)
+        && optString(d.address, 500)
+        && (d.emergencyContact == null
+            || (d.emergencyContact is map
+                && d.emergencyContact.keys().hasOnly(['name', 'mobile'])
+                && d.emergencyContact.name is string && d.emergencyContact.name.size() >= 1
+                && d.emergencyContact.name.size() <= 50
+                && validMobile(d.emergencyContact.mobile)))
+        && optString(d.trainerId, 100) && optString(d.trainerName, 100)
+        && optString(d.generalNotes, 1000)
+        && d.hasPhoto is bool
+        && d.searchMobile == d.mobile
+        && d.searchFullName is string && d.searchFullName.size() <= 200
+        && d.searchReverseName is string && d.searchReverseName.size() <= 200
+        && searchNamesConsistent(d);
+    }
+
+    // ---- member ID <-> counter: the ID must consume exactly one counter increment IN THE SAME COMMIT ----
+    function counterPath(year) {
+      return /databases/$(database)/documents/counters/$('memberId-' + string(year));
+    }
+    function paddedSeq(n) {
+      return n < 10 ? '000' + string(n) : n < 100 ? '00' + string(n) : n < 1000 ? '0' + string(n) : string(n);
+    }
+    // (`let` binds the value once: a rule evaluation is limited to 1000 expressions, and registering with a plan is the
+    // heaviest commit, so repeated `getAfter(...).data...` chains are avoided.)
+    function counterAdvancedByOne(year, seqNow) {
+      return exists(counterPath(year))
+        ? seqNow == get(counterPath(year)).data.lastSeq + 1
+        : seqNow == 1;
+    }
+    // memberId is DETERMINED by the counter value written in this commit, and that counter names THIS document as its
+    // one new member, so an ID can neither be forged nor reused and one increment cannot serve two members.
+    function memberIdMatchesCounter(memberDocId, d) {
+      let year = d.memberIdYear;
+      return year is int
+        && year >= request.time.year() - 1 && year <= request.time.year() + 1
+        && memberIdFromCounter(memberDocId, d, year, getAfter(counterPath(year)).data);
+    }
+    function memberIdFromCounter(memberDocId, d, year, counterAfter) {
+      return counterAdvancedByOne(year, counterAfter.lastSeq)
+        && counterAfter.lastMemberDocId == memberDocId
+        && d.memberId == 'GYM-' + string(year) + '-' + paddedSeq(counterAfter.lastSeq);
+    }
+
+    function validConsent(d) {
+      return d.consent is map
+        && d.consent.keys().hasOnly(['given', 'at', 'byUid', 'byName', 'version', 'guardianConsent'])
+        && d.consent.given == true
+        && d.consent.at == request.time
+        && d.consent.byUid == request.auth.uid
+        && d.consent.byName is string && d.consent.version is string && d.consent.guardianConsent is bool
+        // a guardian-consent registration must carry the guardian (emergency contact)
+        && (d.consent.guardianConsent == false || d.emergencyContact != null);
+    }
+
+    // ---- membership summary on the member <-> the membership document created in the same commit (Phase 3) ----
+    function membershipPath(id) { return /databases/$(database)/documents/memberships/$(id); }
+    function summaryKeys() { return ['membershipId', 'planId', 'planName', 'startDate', 'endDate', 'amountPaise']; }
+    function noMembershipSummary(d) {
+      return d.hasMembership == false
+        && d.pendingPaise == 0
+        && d.membership == { 'membershipId': null, 'planId': null, 'planName': null,
+                             'startDate': null, 'endDate': null, 'amountPaise': null };
+    }
+    // The summary must mirror a membership that is NEW in this commit (never re-point at an old one) and belongs here.
+    function summaryMatchesNewMembership(memberDocId, s) {
+      return s is map
+        && s.keys().hasOnly(summaryKeys()) && s.keys().hasAll(summaryKeys())
+        && s.membershipId is string && s.membershipId.size() >= 1 && s.membershipId.size() <= 100
+        && !exists(membershipPath(s.membershipId))
+        && existsAfter(membershipPath(s.membershipId))
+        && summaryEqualsMembership(memberDocId, s, getAfter(membershipPath(s.membershipId)).data);
+    }
+    function summaryEqualsMembership(memberDocId, s, m) {
+      return m.memberDocId == memberDocId
+        && m.planId == s.planId && m.planName == s.planName
+        && m.startDate == s.startDate && m.endDate == s.endDate && m.amountPaise == s.amountPaise;
+    }
+
+    // ---- payments <-> membership paid total <-> member pending total (Phase 4) ----
+    // A balance change is only accepted together with the payment that explains it, IN THE SAME COMMIT. The link is the audit
+    // record of the commit: a membership / member update names it in `lastAuditId`, and that record's `entityId` is the payment.
+    function paymentPath(id) { return /databases/$(database)/documents/payments/$(id); }
+    function auditPath(id)   { return /databases/$(database)/documents/auditLogs/$(id); }
+
+    // ---- audit atomicity (architecture section 3.4, R-1): no members / memberships / payments write without its audit record ----
+    // The document names its audit record in `lastAuditId`. That record must be CREATED IN THIS COMMIT (the auditLogs rule forces
+    // `at == request.time` and every write of a commit shares that time, so an older record cannot be re-used) and must be ABOUT
+    // this document and this kind of action. One `getAfter` (a missing record makes the expression error, i.e. deny). Records are
+    // create-only, so what getAfter sees is exactly what was committed. A hostile client can still write a WRONG-BUT-WELL-FORMED
+    // record; it can no longer write the document with NO record.
+    function auditAbout(id, entity, entityId, actions) {
+      let a = getAfter(auditPath(id)).data;
+      return a.at == request.time && a.entity == entity && a.entityId == entityId && a.action in actions;
+    }
+    function paymentCreatedInCommit(pid) { return !exists(paymentPath(pid)) && existsAfter(paymentPath(pid)); }
+    function paymentVoidedInCommit(pid) {
+      return exists(paymentPath(pid)) && get(paymentPath(pid)).data.voided == false
+        && getAfter(paymentPath(pid)).data.voided == true;
+    }
+    // membership.paidPaise moves by exactly the created payment's amount (up) or the voided payment's amount (down)
+    function membershipMovedByPayment(membershipId, before, after) {
+      let a = getAfter(auditPath(after.lastAuditId)).data;
+      let p = paymentPath(a.entityId);
+      return a.entity == 'payment'
+        && getAfter(p).data.membershipId == membershipId
+        && ((a.action == 'PAYMENT_CREATED' && paymentCreatedInCommit(a.entityId)
+             && after.paidPaise == before.paidPaise + getAfter(p).data.amountPaise)
+            || (a.action == 'PAYMENT_VOIDED' && paymentVoidedInCommit(a.entityId)
+                && after.paidPaise == before.paidPaise - getAfter(p).data.amountPaise));
+    }
+    // member.pendingPaise moves by exactly the same amount, the other way. (A first payment is taken with a NEW membership and
+    // reaches the member through its membership's outstanding amount, so its id, `<membershipId>_first`, is excluded here.)
+    function pendingMovedByPayment(memberDocId, before, after) {
+      let a = getAfter(auditPath(after.lastAuditId)).data;
+      let p = paymentPath(a.entityId);
+      return a.entity == 'payment'
+        && getAfter(p).data.memberDocId == memberDocId
+        && ((a.action == 'PAYMENT_CREATED' && !a.entityId.matches('.*_first') && paymentCreatedInCommit(a.entityId)
+             && after.pendingPaise == before.pendingPaise - getAfter(p).data.amountPaise)
+            || (a.action == 'PAYMENT_VOIDED' && paymentVoidedInCommit(a.entityId)
+                && after.pendingPaise == before.pendingPaise + getAfter(p).data.amountPaise));
+    }
+
+    // (Phase 8) Everything a NEW member document must satisfy, over `d` = request.resource.data. Kept in one function with short `d.x`
+    // accesses: the rule evaluation is limited to 1000 expressions, registering with a plan + first payment is the heaviest commit, and
+    // the audit-atomicity check (section 3.4) needed the room.
+    function newMemberStamps(d) {
+      return d.deleted == false && d.deletedAt == null && d.deletedBy == null
+        && d.suspended == false && d.suspendedAt == null && d.suspendedReason == null && d.suspendedBy == null
+        && d.createdAt == request.time && d.createdBy == request.auth.uid
+        && d.updatedAt == request.time && d.updatedBy == request.auth.uid;
+    }
+    // no membership yet (any role), or, for an ADMIN only (matrix: assign plan = Admin), together with its first membership in this commit
+    function newMemberMembership(memberDocId, d, admin) {
+      return noMembershipSummary(d)
+        || (admin
+            && d.hasMembership == true
+            && summaryMatchesNewMembership(memberDocId, d.membership)
+            && d.pendingPaise == getAfter(membershipPath(d.membership.membershipId)).data.outstandingPaise);
+    }
+    function memberCreateOk(memberDocId, d, admin) {
+      return keysExactly(d, memberKeys())
+        && validProfile(d)
+        && memberIdMatchesCounter(memberDocId, d)
+        && validConsent(d)
+        && newMemberStamps(d)
+        && newMemberMembership(memberDocId, d, admin)
+        && d.lastAuditId is string
+        && auditAbout(d.lastAuditId, 'member', memberDocId, ['MEMBER_CREATED']);
+    }
+
+    match /members/{memberDocId} {
+      // Staff never see a soft-deleted member (D-8): the resource check makes every Staff query prove `deleted == false`.
+      // `resource == null` (a get of a document that does not exist yet) is allowed so the registration transaction's
+      // "already created?" read works for Staff; it reveals nothing.
+      allow get, list: if isAdmin()
+        || (isStaff() && (resource == null || resource.data.deleted == false))
+        || (isMember() && memberDocId == myMemberDocId());
+
+      // Register: Admin or Staff (matrix). A brand-new, undeleted member. With NO membership (any role), or, for an
+      // ADMIN only (matrix: assign plan = Admin), together with its first membership created in the same commit.
+      allow create: if (isAdmin() && memberCreateOk(memberDocId, request.resource.data, true))
+        || (isStaff() && memberCreateOk(memberDocId, request.resource.data, false));
+
+      // Edit / soft-delete / suspend / assign-renew: Admin only, never a deleted member, identity + consent immutable.
+      // Every update must write a NEW lastAuditId (the audit record of this write, in the same commit).
+      allow update: if isAdmin()
+        && resource.data.deleted == false
+        && serverTime('updatedAt') && actorIs('updatedBy')
+        && request.resource.data.lastAuditId is string
+        && request.resource.data.lastAuditId != resource.data.lastAuditId
+        && (
+          // profile edit (or the hasPhoto flag)
+          (changed(profileKeys()) && request.resource.data.deleted == false && validProfile(request.resource.data)
+              && auditAbout(request.resource.data.lastAuditId, 'member', memberDocId, ['MEMBER_UPDATED']))
+          // soft delete: a one-way flag flip, nothing else moves
+          || (changed(['deleted', 'deletedAt', 'deletedBy', 'updatedAt', 'updatedBy', 'lastAuditId'])
+              && request.resource.data.deleted == true
+              && request.resource.data.deletedAt == request.time
+              && request.resource.data.deletedBy == request.auth.uid
+              && auditAbout(request.resource.data.lastAuditId, 'member', memberDocId, ['MEMBER_DELETED']))
+          // suspend (only a member that HAS a membership, so Suspended and No-membership never overlap) / reactivate
+          || (changed(['suspended', 'suspendedAt', 'suspendedReason', 'suspendedBy', 'updatedAt', 'updatedBy', 'lastAuditId'])
+              && request.resource.data.deleted == false
+              && ((resource.data.suspended == false && resource.data.hasMembership == true
+                   && request.resource.data.suspended == true
+                   && request.resource.data.suspendedAt == request.time
+                   && request.resource.data.suspendedBy == request.auth.uid
+                   && optString(request.resource.data.suspendedReason, 200)
+                   && auditAbout(request.resource.data.lastAuditId, 'member', memberDocId, ['MEMBER_SUSPENDED']))
+                  || (resource.data.suspended == true
+                      && request.resource.data.suspended == false
+                      && request.resource.data.suspendedAt == null
+                      && request.resource.data.suspendedBy == null
+                      && request.resource.data.suspendedReason == null
+                      && auditAbout(request.resource.data.lastAuditId, 'member', memberDocId, ['MEMBER_REACTIVATED']))))
+          // assign / renew: the summary moves ONLY together with a new membership, the latest end date only moves
+          // forward (D-5), the dues grow by exactly that membership's outstanding amount, and a suspended member
+          // cannot be renewed (NEW-7).
+          || (changed(['hasMembership', 'membership', 'pendingPaise', 'updatedAt', 'updatedBy', 'lastAuditId'])
+              && resource.data.suspended == false
+              && request.resource.data.deleted == false
+              && request.resource.data.hasMembership == true
+              && summaryMatchesNewMembership(memberDocId, request.resource.data.membership)
+              && request.resource.data.pendingPaise
+                 == resource.data.pendingPaise
+                    + getAfter(membershipPath(request.resource.data.membership.membershipId)).data.outstandingPaise
+              && (resource.data.hasMembership == false
+                  || request.resource.data.membership.endDate > resource.data.membership.endDate)
+              && auditAbout(request.resource.data.lastAuditId, 'membership', request.resource.data.membership.membershipId,
+                            ['MEMBERSHIP_CREATED', 'MEMBERSHIP_RENEWED']))
+          // record / void a payment: ONLY the pending total moves, by exactly the amount of the payment created / voided in
+          // this commit (Phase 4). Allowed for a suspended member: taking money is not a renewal.
+          || (changed(['pendingPaise', 'updatedAt', 'updatedBy', 'lastAuditId'])
+              && request.resource.data.deleted == false
+              && request.resource.data.pendingPaise is int && request.resource.data.pendingPaise >= 0
+              && pendingMovedByPayment(memberDocId, resource.data, request.resource.data))
+        );
+
+      allow delete: if false;   // soft delete only (Q6, D-8)
+    }
+
+    // ---------------------------------------------------------------- memberMedical (ADMIN ONLY, compliance)
+    // Physically separate from `members` because rules cannot hide a single field (US-2.6b). It can only exist for a
+    // member that exists (existsAfter: the registration commit creates both together).
+    match /memberMedical/{memberDocId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin()
+        && existsAfter(memberPath(memberDocId))
+        && request.resource.data.keys().hasOnly(['notes', 'updatedAt', 'updatedBy'])
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() >= 1 && request.resource.data.notes.size() <= 1000
+        && serverTime('updatedAt') && actorIs('updatedBy');
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------- memberPhotos
+    // Staff may ADD a photo (registration, or a retry from the profile) but not replace one; Admin may replace/delete.
+    // No photo can be added to a soft-deleted member.
+    function validPhoto(d) {
+      return d.keys().hasOnly(['dataUrl', 'contentType', 'bytes', 'width', 'height', 'updatedAt', 'updatedBy'])
+        && d.contentType in ['image/webp', 'image/jpeg']
+        && d.dataUrl is string && d.dataUrl.size() <= 180000
+        && d.dataUrl.matches('^data:' + d.contentType + ';base64,[A-Za-z0-9+/]+={0,2}$')
+        && d.bytes is int && d.bytes > 0 && d.bytes <= 102400
+        && d.width is int && d.width > 0 && d.width <= 1024
+        && d.height is int && d.height > 0 && d.height <= 1024
+        && d.updatedAt == request.time && d.updatedBy == request.auth.uid;
+    }
+    match /memberPhotos/{memberDocId} {
+      allow read: if staffOrAdmin() || (isMember() && memberDocId == myMemberDocId());
+      allow create: if staffOrAdmin() && validPhoto(request.resource.data)
+        && existsAfter(memberPath(memberDocId))
+        && getAfter(memberPath(memberDocId)).data.deleted == false;
+      allow update: if isAdmin() && validPhoto(request.resource.data)
+        && get(memberPath(memberDocId)).data.deleted == false;
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------- membershipPlans (Phase 3)
+    // Staff read (matrix: plans view), Admin write. "Delete only when safe" cannot be enforced here (rules cannot query);
+    // the client counts referencing memberships first and the residual race is benign (memberships snapshot the plan).
+    function planKeys() {
+      return ['name', 'nameLower', 'durationValue', 'durationUnit', 'pricePaise', 'description', 'active',
+              'createdAt', 'createdBy', 'updatedAt', 'updatedBy'];
+    }
+    function validPlan(d) {
+      return d.keys().hasOnly(planKeys()) && d.keys().hasAll(planKeys())
+        && d.name is string && d.name.size() >= 1 && d.name.size() <= 60
+        && d.nameLower is string && d.nameLower.size() >= 1 && d.nameLower.size() <= 60
+        && (d.name.matches('^[ -~]*$') ? d.nameLower == d.name.lower() : d.nameLower == d.nameLower.lower())
+        && d.durationUnit in ['DAYS', 'MONTHS']
+        && d.durationValue is int && d.durationValue >= 1
+        && (d.durationUnit == 'DAYS' ? d.durationValue <= 3650 : d.durationValue <= 120)
+        && d.pricePaise is int && d.pricePaise > 0 && d.pricePaise <= 100000000000
+        && optString(d.description, 300)
+        && d.active is bool
+        && d.updatedAt == request.time && d.updatedBy == request.auth.uid;
+    }
+    match /membershipPlans/{planId} {
+      allow get, list: if staffOrAdmin();
+      allow create: if isAdmin() && validPlan(request.resource.data)
+        && serverTime('createdAt') && actorIs('createdBy');
+      allow update: if isAdmin() && validPlan(request.resource.data)
+        && unchanged('createdAt') && unchanged('createdBy');
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------- memberships (Phase 3)
+    // One document per assign / renew. The period, plan and amount are history and can NEVER change (a member can never
+    // change an expiry, and neither can an Admin after the fact); the only update is the paid / outstanding / unpaid triple,
+    // and only together with the payment that created or voided (Phase 4). Never deleted.
+    function membershipKeys() {
+      return ['memberDocId', 'memberId', 'memberDisplayName', 'planId', 'planName', 'planDurationValue',
+              'planDurationUnit', 'startDate', 'endDate', 'amountPaise', 'paidPaise', 'outstandingPaise', 'unpaid',
+              'createdAt', 'createdBy', 'updatedAt', 'updatedBy', 'lastAuditId'];
+    }
+    // a membership created with paidPaise > 0 must come with exactly that payment (id `<membershipId>_first`) in the same commit
+    function firstPaymentTaken(membershipId, d) {
+      let p = paymentPath(membershipId + '_first');
+      return existsAfter(p)
+        && getAfter(p).data.membershipId == membershipId
+        && getAfter(p).data.amountPaise == d.paidPaise;
+    }
+    function validMembership(membershipId, d) {
+      return d.keys().hasOnly(membershipKeys()) && d.keys().hasAll(membershipKeys())
+        && d.memberDocId is string && d.memberDocId.size() >= 1 && d.memberDocId.size() <= 100
+        && d.memberId is string && d.memberId.matches('^GYM-[0-9]{4}-[0-9]{4,}$')
+        && d.memberDisplayName is string && d.memberDisplayName.size() >= 1 && d.memberDisplayName.size() <= 101
+        && d.planId is string && d.planId.size() >= 1 && d.planId.size() <= 100
+        && d.planName is string && d.planName.size() >= 1 && d.planName.size() <= 60
+        && d.planDurationUnit in ['DAYS', 'MONTHS']
+        && d.planDurationValue is int && d.planDurationValue >= 1
+        && (d.planDurationUnit == 'DAYS' ? d.planDurationValue <= 3650 : d.planDurationValue <= 120)
+        && isIstMidnight(d.startDate) && isIstMidnight(d.endDate) && d.endDate >= d.startDate   // 1-day plan: end == start
+        && d.amountPaise is int && d.amountPaise > 0
+        // unpaid, or with a FIRST PAYMENT taken in this same commit (Phase 4): paid + outstanding = amount, never negative
+        && d.paidPaise is int && d.paidPaise >= 0 && d.paidPaise <= d.amountPaise
+        && d.outstandingPaise == d.amountPaise - d.paidPaise && d.unpaid == (d.outstandingPaise > 0)
+        && (d.paidPaise == 0 || firstPaymentTaken(membershipId, d))
+        && d.lastAuditId is string
+        && auditAbout(d.lastAuditId, 'membership', membershipId, ['MEMBERSHIP_CREATED', 'MEMBERSHIP_RENEWED'])
+        && d.createdAt == request.time && d.createdBy == request.auth.uid
+        && d.updatedAt == request.time && d.updatedBy == request.auth.uid
+        // the snapshot is exactly the ACTIVE plan being sold (NEW-3: amount = plan price, read-only)
+        && get(/databases/$(database)/documents/membershipPlans/$(d.planId)).data.active == true
+        && get(/databases/$(database)/documents/membershipPlans/$(d.planId)).data.pricePaise == d.amountPaise
+        && get(/databases/$(database)/documents/membershipPlans/$(d.planId)).data.name == d.planName
+        && get(/databases/$(database)/documents/membershipPlans/$(d.planId)).data.durationValue == d.planDurationValue
+        && get(/databases/$(database)/documents/membershipPlans/$(d.planId)).data.durationUnit == d.planDurationUnit
+        // the (live) member exists after this commit, matches the snapshot, and its summary points at THIS membership
+        && getAfter(memberPath(d.memberDocId)).data.deleted == false
+        && getAfter(memberPath(d.memberDocId)).data.memberId == d.memberId
+        && getAfter(memberPath(d.memberDocId)).data.displayName == d.memberDisplayName
+        && getAfter(memberPath(d.memberDocId)).data.membership.membershipId == membershipId
+        && getAfter(memberPath(d.memberDocId)).data.membership.endDate == d.endDate;
+    }
+    match /memberships/{membershipId} {
+      allow get, list: if staffOrAdmin() || (isMember() && resource.data.memberDocId == myMemberDocId());
+      allow create: if isAdmin() && validMembership(membershipId, request.resource.data);
+      allow update: if isAdmin()
+        && changed(['paidPaise', 'outstandingPaise', 'unpaid', 'updatedAt', 'updatedBy', 'lastAuditId'])
+        && serverTime('updatedAt') && actorIs('updatedBy')
+        && request.resource.data.lastAuditId is string
+        && request.resource.data.lastAuditId != resource.data.lastAuditId
+        && request.resource.data.paidPaise is int && request.resource.data.paidPaise >= 0
+        && request.resource.data.paidPaise <= resource.data.amountPaise
+        && request.resource.data.outstandingPaise == resource.data.amountPaise - request.resource.data.paidPaise
+        && request.resource.data.unpaid == (request.resource.data.outstandingPaise > 0)
+        && membershipMovedByPayment(membershipId, resource.data, request.resource.data);
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------- payments (Phase 4)
+    // Money received. ADMIN ONLY (matrix: Staff cannot record, void or view payments; a Member reads only their own, future).
+    // IMMUTABLE: never edited or deleted; the only update is the one-way void with a reason (NEW-9). The commit that creates
+    // or voids a payment must also move the membership's paid total by exactly that amount (getAfter invariant), and the
+    // membership / member rules above accept a balance change only with such a payment.
+    function paymentKeys() {
+      return ['memberDocId', 'memberId', 'memberDisplayName', 'membershipId', 'amountPaise', 'paymentDate', 'method',
+              'transactionReference', 'notes', 'voided', 'voidReason', 'voidedAt', 'voidedBy', 'createdAt', 'createdBy',
+              'createdByName', 'lastAuditId'];
+    }
+    function validPaymentShape(d) {
+      return d.keys().hasOnly(paymentKeys()) && d.keys().hasAll(paymentKeys())
+        && d.memberDocId is string && d.memberDocId.size() >= 1 && d.memberDocId.size() <= 100
+        && d.memberId is string && d.memberId.matches('^GYM-[0-9]{4}-[0-9]{4,}$')
+        && d.memberDisplayName is string && d.memberDisplayName.size() >= 1 && d.memberDisplayName.size() <= 101
+        && d.membershipId is string && d.membershipId.size() >= 1 && d.membershipId.size() <= 100
+        && d.amountPaise is int && d.amountPaise > 0 && d.amountPaise <= 100000000000
+        && isIstMidnight(d.paymentDate) && d.paymentDate <= request.time      // today or past, never the future (NEW-5)
+        && d.method in ['CASH', 'UPI', 'CARD', 'BANK_TRANSFER', 'OTHER']       // no card data is ever stored
+        && optString(d.transactionReference, 100) && optString(d.notes, 500)
+        && d.voided == false && d.voidReason == null && d.voidedAt == null && d.voidedBy == null
+        && d.createdAt == request.time && d.createdBy == request.auth.uid
+        && d.createdByName is string && d.createdByName.size() >= 1 && d.createdByName.size() <= 100
+        && d.lastAuditId is string && d.lastAuditId.size() >= 1 && d.lastAuditId.size() <= 100;
+    }
+    // TX-4: an existing membership of this member; not overpaid; its paid total rises by exactly this amount in this commit
+    function paymentOnExistingMembership(d) {
+      let m = membershipPath(d.membershipId);
+      return exists(m)
+        && get(m).data.memberDocId == d.memberDocId
+        && get(m).data.memberId == d.memberId
+        && get(m).data.memberDisplayName == d.memberDisplayName
+        && d.amountPaise <= get(m).data.outstandingPaise
+        && getAfter(m).data.paidPaise == get(m).data.paidPaise + d.amountPaise
+        // ...and the member's pending total falls by the same amount (a live member: nothing may write a deleted one)
+        && getAfter(memberPath(d.memberDocId)).data.pendingPaise
+           == get(memberPath(d.memberDocId)).data.pendingPaise - d.amountPaise;
+    }
+    // first payment (registration / assign / renew): the membership is created in this commit with paidPaise == amount
+    function paymentOnNewMembership(paymentId, d) {
+      let m = membershipPath(d.membershipId);
+      return !exists(m) && existsAfter(m)
+        && paymentId == d.membershipId + '_first'
+        && getAfter(m).data.memberDocId == d.memberDocId
+        && getAfter(m).data.memberId == d.memberId
+        && getAfter(m).data.memberDisplayName == d.memberDisplayName
+        && getAfter(m).data.paidPaise == d.amountPaise;
+    }
+    match /payments/{paymentId} {
+      allow get, list: if isAdmin() || (isMember() && resource.data.memberDocId == myMemberDocId());
+      allow create: if isAdmin() && validPaymentShape(request.resource.data)
+        && auditAbout(request.resource.data.lastAuditId, 'payment', paymentId, ['PAYMENT_CREATED'])
+        && (paymentOnExistingMembership(request.resource.data) || paymentOnNewMembership(paymentId, request.resource.data));
+      // TX-5: the one-way void. Nothing but the void fields changes; the membership's paid total falls by exactly the amount.
+      allow update: if isAdmin()
+        && resource.data.voided == false && request.resource.data.voided == true
+        && changed(['voided', 'voidReason', 'voidedAt', 'voidedBy', 'lastAuditId'])
+        && request.resource.data.voidReason is string
+        && request.resource.data.voidReason.size() >= 1 && request.resource.data.voidReason.size() <= 200
+        && !request.resource.data.voidReason.matches('^ *$')
+        && request.resource.data.voidedAt == request.time
+        && request.resource.data.voidedBy == request.auth.uid
+        && request.resource.data.lastAuditId is string
+        && request.resource.data.lastAuditId != resource.data.lastAuditId
+        && auditAbout(request.resource.data.lastAuditId, 'payment', paymentId, ['PAYMENT_VOIDED'])
+        && getAfter(membershipPath(resource.data.membershipId)).data.paidPaise
+           == get(membershipPath(resource.data.membershipId)).data.paidPaise - resource.data.amountPaise
+        // ...and the member's pending total rises by the same amount, unless the member has been soft-deleted (then nothing may
+        // write the member document, and its dues are already excluded from every list and total)
+        && (get(memberPath(resource.data.memberDocId)).data.deleted == true
+            || getAfter(memberPath(resource.data.memberDocId)).data.pendingPaise
+               == get(memberPath(resource.data.memberDocId)).data.pendingPaise + resource.data.amountPaise);
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------- trainers (NEW-2)
+    function validTrainer(d) {
+      return d.keys().hasOnly(['name', 'mobile', 'active', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy'])
+        && d.name is string && d.name.size() >= 1 && d.name.size() <= 80
+        && (d.mobile == null || validMobile(d.mobile))
+        && d.active is bool
+        && d.updatedAt == request.time && d.updatedBy == request.auth.uid;
+    }
+    // Matrix: Admin manage, Staff read, Member NO (Phase 8: was hasRole(), which let a Member read trainer names / mobiles).
+    match /trainers/{trainerId} {
+      allow read: if staffOrAdmin();
+      allow create: if isAdmin() && validTrainer(request.resource.data)
+        && serverTime('createdAt') && actorIs('createdBy');
+      allow update: if isAdmin() && validTrainer(request.resource.data)
+        && unchanged('createdAt') && unchanged('createdBy');
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------- auditLogs (APPEND ONLY)
+    // Create-only, stamped with the server time and the caller's own uid and role. Never updated or deleted (US-2.14c).
+    //
+    // REPORT_EXPORTED (Phase 6, NEW-20) records a bulk export of personal data. It is the only action that is tied to entity
+    // 'report' (both ways), it is ADMIN ONLY (a Staff user gets no export trail, so a modified Staff client gets no audited
+    // export either), and its metadata may carry ONLY the report id, the date filters, the row count and the truncated flag:
+    // no member name, mobile, amount or any other personal value.
+    function validExportAudit(d) {
+      let m = d.metadata;
+      return isAdmin()
+        && d.entityId in ['MEMBERS', 'EXPIRED', 'EXPIRING', 'REVENUE', 'ATTENDANCE', 'PENDING']
+        && m.keys().hasOnly(['report', 'from', 'to', 'status', 'rowCount', 'truncated', 'rowCap'])
+        && m.keys().hasAll(['report', 'from', 'to', 'rowCount', 'truncated', 'rowCap'])
+        && m.report == d.entityId
+        && m.from is string && m.from.matches('^(any|[0-9]{2}/[0-9]{2}/[0-9]{4})$')
+        && m.to is string && m.to.matches('^(any|[0-9]{2}/[0-9]{2}/[0-9]{4})$')
+        && m.get('status', 'ALL') in ['ALL', 'PRESENT', 'ABSENT']
+        && m.rowCount is int && m.rowCount >= 0 && m.rowCap is int && m.rowCap >= 1 && m.rowCap <= 100000
+        && m.rowCount <= m.rowCap
+        && m.truncated is bool;
+    }
+    match /auditLogs/{auditId} {
+      allow read: if isAdmin();
+      allow create: if staffOrAdmin()
+        && request.resource.data.keys().hasOnly(['actorUid', 'actorName', 'actorRole', 'action', 'entity', 'entityId',
+                                                   'entityLabel', 'at', 'metadata'])
+        && request.resource.data.keys().hasAll(['actorUid', 'actorName', 'actorRole', 'action', 'entity', 'entityId',
+                                                  'entityLabel', 'at', 'metadata'])
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.actorRole == role()
+        && request.resource.data.actorName is string
+        && request.resource.data.at == request.time
+        && request.resource.data.action in ['MEMBER_CREATED', 'MEMBER_UPDATED', 'MEMBER_DELETED', 'MEMBER_SUSPENDED',
+                                           'MEMBER_REACTIVATED', 'MEMBERSHIP_CREATED', 'MEMBERSHIP_RENEWED',
+                                           'PAYMENT_CREATED', 'PAYMENT_VOIDED', 'PLAN_CREATED', 'PLAN_UPDATED',
+                                           'PLAN_DELETED', 'REPORT_EXPORTED']
+        && request.resource.data.entity in ['member', 'membership', 'payment', 'plan', 'report']
+        && request.resource.data.entityId is string
+        && request.resource.data.entityLabel is string
+        && request.resource.data.metadata is map
+        && (request.resource.data.entity == 'report') == (request.resource.data.action == 'REPORT_EXPORTED')
+        && (request.resource.data.action != 'REPORT_EXPORTED' || validExportAudit(request.resource.data));
+      allow update, delete: if false;
+    }
+
+    // ---------------------------------------------------------------- attendance (Phase 5)
+    // One record per member per IST day: the document id is `{memberDocId}_{YYYYMMDD}` and the day is taken from the SERVER
+    // time (request.time), never from the client, so a record cannot be filed under another day and a check-in at 00:10 IST
+    // belongs to the new IST day. Admin AND Staff may check in / out and mark absent (matrix); only Admin may delete; nobody can
+    // edit a record any other way. Check-in and check-out times are server timestamps (== request.time). A SUSPENDED or deleted
+    // member cannot be checked in (NEW-12). The member's ATTENDANCE HISTORY is readable by Staff/Admin and by the member (own).
+    function attendanceKeys() {
+      return ['memberDocId', 'memberId', 'memberName', 'date', 'dateKey', 'status', 'checkInAt', 'checkOutAt', 'checkedOut',
+              'createdAt', 'createdBy', 'updatedAt', 'updatedBy'];
+    }
+    // India has no daylight saving: the IST wall clock is UTC + 05:30, a fixed offset.
+    function istWallNow()  { return request.time + duration.value(19800, 's'); }
+    function istTodayKey() { let w = istWallNow(); return string(w.year() * 10000 + w.month() * 100 + w.day()); }
+    // 00:00 IST of today, as epoch millis (a stored `date` is exactly this instant)
+    function istTodayStartMillis() { return request.time.toMillis() - ((request.time.toMillis() + 19800000) % 86400000); }
+    function isTodayRecord(d) { return d.dateKey == istTodayKey() && d.date.toMillis() == istTodayStartMillis(); }
+
+    // create: today's record for a live member, either a check-in (PRESENT) or an explicit absent mark. `let m` reads the
+    // member once (a rule evaluation is limited to 1000 expressions and to a few document reads).
+    function attendanceCreateOk(id, d) {
+      let m = get(memberPath(d.memberDocId)).data;
+      return keysExactly(d, attendanceKeys())
+        && id == d.memberDocId + '_' + d.dateKey
+        && isTodayRecord(d)
+        && m.deleted == false && m.memberId == d.memberId && m.displayName == d.memberName
+        && d.checkOutAt == null && d.checkedOut == false
+        && ((d.status == 'PRESENT' && d.checkInAt == request.time && m.suspended == false)
+            || (d.status == 'ABSENT' && d.checkInAt == null))
+        && d.createdAt == request.time && d.createdBy == request.auth.uid
+        && d.updatedAt == request.time && d.updatedBy == request.auth.uid;
+    }
+    // update: only TODAY's record, only one of two transitions, never anything else (identity, snapshot, date are frozen):
+    //   check-out:  PRESENT, not yet checked out -> checkedOut, checkOutAt == now, strictly AFTER the check-in (US-5.2a/b)
+    //   check-in:   ABSENT -> PRESENT, checkInAt == now, member live and not suspended (US-5.3b, NEW-12)
+    function attendanceUpdateOk(b, a) {
+      return a.updatedAt == request.time && a.updatedBy == request.auth.uid
+        && isTodayRecord(b)
+        && ((b.status == 'PRESENT' && b.checkedOut == false
+             && changed(['checkOutAt', 'checkedOut', 'updatedAt', 'updatedBy'])
+             && a.checkedOut == true && a.checkOutAt == request.time && a.checkOutAt > b.checkInAt)
+            || (b.status == 'ABSENT'
+                && changed(['status', 'checkInAt', 'updatedAt', 'updatedBy'])
+                && a.status == 'PRESENT' && a.checkInAt == request.time
+                && attendanceMemberMayCheckIn(b.memberDocId)));
+    }
+    function attendanceMemberMayCheckIn(memberDocId) {
+      let m = get(memberPath(memberDocId)).data;
+      return m.deleted == false && m.suspended == false;
+    }
+    match /attendance/{attendanceId} {
+      allow get, list: if staffOrAdmin() || (isMember() && resource.data.memberDocId == myMemberDocId());
+      allow create: if staffOrAdmin() && attendanceCreateOk(attendanceId, request.resource.data);
+      allow update: if staffOrAdmin() && attendanceUpdateOk(resource.data, request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // deny by default (US-1.9d): every other path, including notifications and settings (no client reads or writes them)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
